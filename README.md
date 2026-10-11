@@ -1,117 +1,81 @@
-<!-- Last updated: 2025-08-21T17:25:27Z -->
+<!-- Last updated: 2026-10-11 -->
 # 🤖 Minecraft AFK Bot (Mineflayer-Based)
 
-This is a lightweight Minecraft Java AFK Bot powered by [Mineflayer](https://github.com/PrismarineJS/mineflayer). It connects to a Java server, performs basic movements to avoid AFK detection, and can be customized via a simple configuration file.
+This is a lightweight Minecraft Java AFK bot powered by [Mineflayer](https://github.com/PrismarineJS/mineflayer). It connects to a Java server, performs basic movement to help avoid AFK detection, and can be customized using `config.json`.
 
-<p>
-  <a href="https://discord.gg/SjQydGvs5p" target="_blank">
-    <img src="https://img.shields.io/badge/Discord-Join-7289DA?logo=discord&logoColor=white" alt="Discord" width="300" />
-  </a>
-</p>
+## ⚠️ Before you begin
 
-<p>
-  <a href="https://buy.polar.sh/polar_cl_yODs3Ofw3OH6yaZYZYBgRSSZKYneEpLjkBm702IGyN2" target="_blank">
-    <img src="https://img.shields.io/badge/💖_Support_&_Contribute-8B5CF6?logoColor=white" alt="Contribute on Polar" width="300" />
-  </a>
-</p>
-
-# ⭐ Star this project, fork and use!
-
-## ⚠️ Warning Before You Begin
-
-- Before starting the bot, please make sure that the Offline Mode (Pirated/Not Original) option in the settings section of your Aternos server is active.
-
-- Secure the bot to protect it from monsters in the game.
-
----
+- Make sure you are allowed to connect a bot to the server.
+- For offline/cracked servers, configure the server accordingly.
+- If the server uses an authentication plugin (for example, AuthMe), configure the bot account and password correctly.
+- The bot intentionally stops automatic authentication retries when the server reports a password error or registration limit. Client code cannot legitimately bypass a server-side registration limit.
 
 ## ✨ Features
 
-* Connect to Minecraft Java servers (IP + port)
-* Customize bot username
-* Control chunk loading and memory usage
-* Periodic chunk pruning to reduce resource usage
-* Auto-movement behavior: step forward/backward, jump, sneak, loop
-* Easy configuration via `config.json`
-
----
+- Connect to Minecraft Java servers (IP + port)
+- Customize the bot username
+- Configure view distance / chunk usage
+- Move forward and backward, jump, and sneak to reduce AFK detection
+- Reconnect after ordinary network disconnects, with a single reconnect timer
+- Authenticate only in response to the server's login/register prompt, without blind repeated registration attempts
 
 ## ⚡ Installation
 
-### 1. Clone the repository
-
-```bash
-git clone https://github.com/nuekkis/Minecraft-AFK-Bot.git
-cd Minecraft-AFK-Bot
-```
-
-### 2. Install dependencies
+Clone the repository and install its dependencies:
 
 ```bash
 npm install
 ```
 
-### 3. Configure `config.json`
+## ⚙️ Configure `config.json`
+
+Example:
 
 ```json
 {
   "serverHost": "yourserver.aternos.me",
   "serverPort": 25565,
   "botUsername": "MyBotName",
-  "botChunk": 4
+  "botChunk": 4,
+  "reconnectDelay": 30000
 }
 ```
 
-> ⚠️ Make sure the server is in offline mode if you're not using premium accounts.
+`serverHost` and `serverPort` must match the current server address and port. `reconnectDelay` is measured in milliseconds; reconnects use at least 30 seconds to avoid rapid join attempts.
 
----
+### Set the bot password securely
 
-## 🤖 Starting the Bot
+`bot.js` reads the password from the `BOT_PASSWORD` environment variable. This is the recommended method on hosting services such as Hyehost:
+
+1. Open your app's hosting panel.
+2. Find **Environment Variables** / **Secrets**.
+3. Add `BOT_PASSWORD` with the password for the configured Minecraft account.
+4. Save and restart the app.
+
+Do not commit your real password to `config.json` or post it in public logs. For local testing only, the legacy `botPassword` property is still supported, but an environment variable takes precedence.
+
+## 🤖 Start the bot
 
 ```bash
-node bot.js
+npm start
 ```
 
-On successful connection:
+The console should show that the bot is connecting and then waiting for the server's authentication prompt. Movement starts only after authentication is confirmed.
 
-* You'll see `✅ BotName is Ready!` in the console
-* After 5 seconds, all loaded chunks are cleared
-* Every 20 seconds, any chunks beyond a 6-chunk radius will be removed
+## 🔐 Authentication troubleshooting
 
----
+- **“This user isn't registered!”** — the account does not appear to exist in the server's authentication plugin. The bot can respond to a registration prompt once.
+- **“You have exceeded the maximum number of registrations”** — the server has reached its account-registration quota for the connection/IP. Stop the bot and ask the server administrator to check the account or registration policy; restarting repeatedly will not fix this limit.
+- **“Incorrect password”** — check the `BOT_PASSWORD` value and account name.
+- **“Login timeout exceeded”** — check that the credentials and registration state are valid and that the server is replying to the bot. Avoid running multiple copies of the bot at the same time.
+- **“EPIPE” / socket closed** — indicates a write to a closed connection. The bot stops auth sends on disconnect and reconnects once after a delay for ordinary network failures.
 
-## ⚙️ Configuration Options (`config.json`)
+## Notes
 
-| Key            | Description                                |
-| -------------- | ------------------------------------------ |
-| `serverHost`         | IP or domain of your Minecraft server      |
-| `serverPort`         | Server port (default is 25565)             |
-| `botUsername`     | The bot's visible name in-game             |
-| `botChunk` | Radius of loaded chunks (recommended: 1–6) |
+- Offline-mode servers may not provide premium account skins.
+- Anti-AFK movement may be restricted by server rules or plugins.
+- The bot does not bypass authentication or server-side account limits.
 
----
+## License
 
-## ⚠️ Notes
-
-* **Skins**: Skins might not appear properly if the server is in offline mode.
-* **Sneak Movement**: The bot uses `setControlState('sneak', true)`, but some servers may block or ignore this action.
-* **AFK Prevention**: The bot periodically moves, sneaks, and jumps to prevent disconnection due to inactivity.
-
----
-
-## 📚 Resources & Contributions
-
-* [Mineflayer Docs](https://mineflayer.prismarine.js.org/)
-* [PrismarineJS GitHub](https://github.com/PrismarineJS/)
-
-Feel free to contribute by opening a pull request or submitting an issue.
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License.
-
----
-
-Get started now and keep your server active with a smart, customizable bot! ⛏️
+MIT License.
