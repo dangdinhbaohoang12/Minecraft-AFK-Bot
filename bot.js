@@ -1,5 +1,48 @@
 const mineflayer = require('mineflayer');
+const http = require('node:http');
 const config = require('./config.json');
+
+// Small HTTP health endpoint for hosting services that require the app to bind
+// to PORT (Hyehost Free uses 8080). This endpoint never exposes credentials.
+const healthPort = Number(process.env.PORT) > 0 ? Number(process.env.PORT) : 8080;
+let healthState = {
+  state: 'starting',
+  botConnected: false,
+  authenticated: false,
+  details: 'Starting process',
+  updatedAt: new Date().toISOString()
+};
+
+function setHealthState(state, details, botConnected = false, authenticated = false) {
+  healthState = {
+    state,
+    botConnected,
+    authenticated,
+    details,
+    updatedAt: new Date().toISOString()
+  };
+}
+
+const healthServer = http.createServer((req, res) => {
+  const payload = JSON.stringify({
+    service: 'Minecraft AFK Bot',
+    endpoint: req.url || '/',
+    ...healthState
+  }, null, 2);
+
+  res.writeHead(200, {
+    'content-type': 'application/json; charset=utf-8',
+    'cache-control': 'no-store'
+  });
+  res.end(payload + '\n');
+});
+
+healthServer.on('error', (error) => {
+  console.error('⚠️ HTTP health endpoint error:', error.message || error);
+});
+healthServer.listen(healthPort, '0.0.0.0', () => {
+  console.log(`🌐 HTTP health endpoint listening on 0.0.0.0:${healthPort}`);
+});
 
 // Prefer the host's secret/environment variable. config.botPassword remains
 // supported for local use, but should not be committed to a public repository.
@@ -27,12 +70,14 @@ function isAuthSuccess(text) {
 
 function startBot() {
   if (!PASSWORD) {
+    setHealthState('needs_password', 'BOT_PASSWORD environment variable is missing.');
     console.error(
       '⛔ BOT_PASSWORD is missing. Add BOT_PASSWORD in Hyehost environment variables, then restart the app.'
     );
     return;
   }
 
+  setHealthState('connecting', 'Connecting to the Minecraft server.');
   console.log(
     '🔌 Connecting ' + config.botUsername + ' to ' +
     config.serverHost + ':' + config.serverPort
@@ -74,6 +119,7 @@ function startBot() {
     authBlocked = true;
     clearAuthTimer();
 
+    setHealthState('auth_error', reason, true, false);
     console.error('⛔ Automatic authentication stopped: ' + reason);
     console.error(
       'Fix the account/password or ask the server administrator to resolve the registration limit, then restart the bot.'
@@ -117,6 +163,7 @@ function startBot() {
 
     authed = true;
     clearAuthTimer();
+    setHealthState('online', 'Bot authenticated and ready.', true, true);
     console.log('✅ ' + config.botUsername + ' is authenticated and ready!');
 
     // Reset the reconnect delay after a successful authenticated connection.
@@ -129,6 +176,7 @@ function startBot() {
   }
 
   bot.once('login', () => {
+    setHealthState('waiting_auth', 'Connected; waiting for the server login/register prompt.', true, false);
     console.log('✅ Connected to the server; waiting for its login/register prompt.');
   });
 
@@ -225,6 +273,7 @@ function startBot() {
       // Do not send more chat packets while the socket is closing. The end
       // event below owns reconnect scheduling.
       clearAuthTimer();
+      setHealthState('connection_error', 'Socket closed (' + error.code + ').', false, false);
       console.warn('⚠️ Connection socket closed (' + error.code + ').');
       return;
     }
@@ -248,12 +297,14 @@ function startBot() {
     }
 
     if (authBlocked) {
+      setHealthState('auth_error', 'Authentication blocked; manual account/password fix required.', false, false);
       console.error(
         '⛔ Not reconnecting because authentication is blocked. Resolve the server account/password issue and restart the app.'
       );
       return;
     }
 
+    setHealthState('disconnected', 'Disconnected; reconnect scheduled.', false, false);
     if (reconnectTimer) return;
 
     console.log(
@@ -315,10 +366,12 @@ function startBot() {
 }
 
 if (!PASSWORD) {
+  setHealthState('needs_password', 'BOT_PASSWORD environment variable is missing.');
   console.error(
     '⛔ BOT_PASSWORD is not set. Add it in the hosting panel under Environment Variables, then restart.'
   );
-  process.exitCode = 1;
+  // Keep the HTTP health endpoint alive so the hosting panel can report the
+  // configuration error instead of timing out on an unbound port.
 } else {
   startBot();
 }
