@@ -62,6 +62,8 @@ npm start
 
 The console should show that the bot is connecting and then waiting for the server's authentication prompt. Movement starts only after authentication is confirmed.
 
+The bot also opens a small HTTP health endpoint on `PORT` (defaults to `8080`) and binds to `0.0.0.0` for hosting panels that require an HTTP port. Visiting the app URL returns JSON with the bot state, such as `waiting_auth`, `online`, `needs_password`, or `auth_error`. The endpoint does not expose the password.
+
 ## 🔐 Authentication troubleshooting
 
 - **“This user isn't registered!”** — the account does not appear to exist in the server's authentication plugin. The bot can respond to a registration prompt once.
