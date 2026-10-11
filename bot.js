@@ -109,14 +109,14 @@ function startBot() {
   // prompt, not a blind timer, determines whether to login or register.
   const authCommandsSent = new Set();
 
-  function isSocketWritable() {
+  function isSocketKnownClosed() {
     const socket = bot._client && bot._client.socket;
-    return !ended &&
-      !socketClosed &&
-      !!socket &&
-      !socket.destroyed &&
-      !socket.writableEnded &&
-      socket.writable !== false;
+    // Some client wrappers do not expose a socket at this point. A missing
+    // socket reference alone must not block a chat command while messages are
+    // actively arriving from the server.
+    return ended ||
+      socketClosed ||
+      !!(socket && (socket.destroyed || socket.writableEnded || socket.writable === false));
   }
 
   function onSocketError(error) {
@@ -161,13 +161,11 @@ function startBot() {
 
   function sendAuth(kind) {
     if (ended || authed || authBlocked || authCommandsSent.has(kind)) return;
-    if (!isSocketWritable()) {
-      console.warn('⚠️ Not sending /' + kind + ': Minecraft socket is already closed.');
+    if (isSocketKnownClosed()) {
+      console.warn('⚠️ Not sending /' + kind + ': the Minecraft connection is already closed.');
       clearAuthTimer();
       return;
     }
-
-    authCommandsSent.add(kind);
 
     const command = kind === 'register'
       ? (registerArgs === 1
@@ -175,26 +173,32 @@ function startBot() {
           : '/register ' + PASSWORD + ' ' + PASSWORD)
       : '/login ' + PASSWORD;
 
+    // Mark before writing so repeated server prompts cannot create a command
+    // storm. Log before bot.chat as well, because a socket can fail before the
+    // previous "Sent" message is flushed.
+    authCommandsSent.add(kind);
+    console.log('📤 Attempting /' + kind + ' (one attempt per connection).');
+
     try {
       bot.chat(command);
-      console.log('🔑 Sent /' + kind + ' once for this connection.');
+      console.log('✅ bot.chat() returned for /' + kind + '. Waiting for server response.');
     } catch (error) {
-      console.error('⚠️ Could not send authentication command:', error.message || error);
+      console.error('⛔ bot.chat() failed for /' + kind + ':', error.code || '', error.message || error);
+      socketClosed = true;
+      clearAuthTimer();
     }
   }
 
   function schedulePromptAuth(kind) {
-    if (ended || authed || authBlocked || authCommandsSent.has(kind)) return;
-    if (promptTimer && scheduledAuthKind === kind) return;
+    if (ended || authed || authBlocked) return;
+    if (authCommandsSent.has(kind)) {
+      console.warn('⚠️ Server repeated the /' + kind + ' prompt, but that command was already attempted on this connection.');
+      return;
+    }
 
     clearAuthTimer();
-    scheduledAuthKind = kind;
-    console.log('🔐 Authentication prompt detected; preparing /' + kind + '...');
-    promptTimer = setTimeout(() => {
-      promptTimer = null;
-      scheduledAuthKind = null;
-      sendAuth(kind);
-    }, 250);
+    console.log('🔐 Authentication prompt detected; sending /' + kind + ' immediately.');
+    sendAuth(kind);
   }
 
   function onAuthed() {
@@ -263,6 +267,11 @@ function startBot() {
 
     if (isAuthSuccess(text)) {
       onAuthed();
+      return;
+    }
+
+    if (/login timeout exceeded|timed out.*login|try again/.test(text)) {
+      blockAuthentication('the server timed out before accepting an authentication command.');
       return;
     }
 
