@@ -103,10 +103,43 @@ function startBot() {
   let movementStarted = false;
   let movementPhase = 0;
   let scheduledAuthKind = null;
+  let socketClosed = false;
 
   // Never send the same auth command repeatedly in one connection. The server
   // prompt, not a blind timer, determines whether to login or register.
   const authCommandsSent = new Set();
+
+  function isSocketWritable() {
+    const socket = bot._client && bot._client.socket;
+    return !ended &&
+      !socketClosed &&
+      !!socket &&
+      !socket.destroyed &&
+      !socket.writableEnded &&
+      socket.writable !== false;
+  }
+
+  function onSocketError(error) {
+    if (error && (error.code === 'EPIPE' || error.code === 'ECONNRESET' || error.code === 'ERR_STREAM_DESTROYED')) {
+      socketClosed = true;
+      clearAuthTimer();
+      setHealthState('connection_error', 'Socket error (' + error.code + '). Waiting for disconnect/reconnect.', false, false);
+      console.warn('⚠️ Socket error handled safely (' + error.code + '): ' + (error.message || 'connection closed'));
+      return;
+    }
+    console.error('⚠️ Minecraft socket error:', error);
+  }
+
+  // EPIPE may be emitted by node-minecraft-protocol's underlying TCP socket,
+  // not by Mineflayer's bot EventEmitter. Listen there directly so it cannot
+  // become an unhandled Writable error.
+  const minecraftClient = bot._client;
+  if (minecraftClient && typeof minecraftClient.on === 'function') {
+    minecraftClient.on('error', onSocketError);
+  }
+  if (minecraftClient && minecraftClient.socket && typeof minecraftClient.socket.on === 'function') {
+    minecraftClient.socket.on('error', onSocketError);
+  }
 
   function clearAuthTimer() {
     if (promptTimer) clearTimeout(promptTimer);
@@ -128,6 +161,11 @@ function startBot() {
 
   function sendAuth(kind) {
     if (ended || authed || authBlocked || authCommandsSent.has(kind)) return;
+    if (!isSocketWritable()) {
+      console.warn('⚠️ Not sending /' + kind + ': Minecraft socket is already closed.');
+      clearAuthTimer();
+      return;
+    }
 
     authCommandsSent.add(kind);
 
@@ -151,11 +189,12 @@ function startBot() {
 
     clearAuthTimer();
     scheduledAuthKind = kind;
+    console.log('🔐 Authentication prompt detected; preparing /' + kind + '...');
     promptTimer = setTimeout(() => {
       promptTimer = null;
       scheduledAuthKind = null;
       sendAuth(kind);
-    }, 1500);
+    }, 250);
   }
 
   function onAuthed() {
@@ -269,9 +308,10 @@ function startBot() {
   });
 
   bot.on('error', (error) => {
-    if (error && (error.code === 'EPIPE' || error.code === 'ECONNRESET')) {
+    if (error && (error.code === 'EPIPE' || error.code === 'ECONNRESET' || error.code === 'ERR_STREAM_DESTROYED')) {
       // Do not send more chat packets while the socket is closing. The end
       // event below owns reconnect scheduling.
+      socketClosed = true;
       clearAuthTimer();
       setHealthState('connection_error', 'Socket closed (' + error.code + ').', false, false);
       console.warn('⚠️ Connection socket closed (' + error.code + ').');
@@ -281,9 +321,11 @@ function startBot() {
     console.error('⚠️ Bot error:', error);
   });
 
-  bot.on('end', () => {
+  bot.on('end', (reason) => {
     if (ended) return;
     ended = true;
+    socketClosed = true;
+    console.warn('🔌 Minecraft connection ended:', reason || 'socket closed');
 
     clearAuthTimer();
     clearTimeout(moveTimer);
