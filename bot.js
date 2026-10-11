@@ -1,25 +1,43 @@
 const mineflayer = require('mineflayer');
 const config = require('./config.json');
 
-const PASSWORD = config.botPassword;
+// Prefer the host's secret/environment variable. config.botPassword remains
+// supported for local use, but should not be committed to a public repository.
+const rawPassword = process.env.BOT_PASSWORD || config.botPassword || '';
+const PASSWORD = typeof rawPassword === 'string' ? rawPassword.trim() : '';
+
 const STEP_INTERVAL = 1500;
 const JUMP_DURATION = 500;
+const RECONNECT_DELAY_MS = Math.max(
+  30000,
+  Number(config.reconnectDelay) || 30000
+);
 
-// Auth timing. AuthMe kicks after 30s ("Login timeout exceeded"), so we must be well inside that.
-const AUTH_FIRST_FALLBACK_MS = 4000;  // if the server never prompted us, try on our own after 4s
-const AUTH_RETRY_MS = 5000;           // gap between fallback attempts
-const AUTH_MAX_ATTEMPTS = 6;          // 6 attempts * ~5s = done well before the 30s timeout
-const RECONNECT_DELAY_MS = config.reconnectDelay || 10000;
+// One process-wide reconnect timer prevents duplicate bot instances.
+let reconnectTimer = null;
 
-// Chat lines that mean "we are logged in now" (English + Vietnamese)
 function isAuthSuccess(text) {
-  if (/already (logged|authenticated)|đã đăng nhập|da dang nhap/.test(text)) return true;
-  const ok = /success|thành công|thanh cong/.test(text);
-  const about = /log|regist|đăng|dang/.test(text);
-  return ok && about;
+  if (/already (logged|authenticated)|you are now logged in|đã đăng nhập|da dang nhap/.test(text)) {
+    return true;
+  }
+
+  return /success|thành công|thanh cong/.test(text) &&
+    /log|regist|đăng|dang/.test(text);
 }
 
 function startBot() {
+  if (!PASSWORD) {
+    console.error(
+      '⛔ BOT_PASSWORD is missing. Add BOT_PASSWORD in Hyehost environment variables, then restart the app.'
+    );
+    return;
+  }
+
+  console.log(
+    '🔌 Connecting ' + config.botUsername + ' to ' +
+    config.serverHost + ':' + config.serverPort
+  );
+
   const bot = mineflayer.createBot({
     host: config.serverHost,
     port: config.serverPort,
@@ -31,142 +49,236 @@ function startBot() {
 
   let ended = false;
   let authed = false;
-  let authStarted = false;
-  let attempts = 0;
-  let registerArgs = 2;            // 2 = "/register <pw> <pw>", 1 = "/register <pw>"
-  let lastSentAt = 0;
+  let authBlocked = false;
+  let registerArgs = 2;
   let promptTimer = null;
-  let fallbackTimer = null;
   let moveTimer = null;
+  let sneakTimer = null;
+  let jumpTimer = null;
   let movementStarted = false;
   let movementPhase = 0;
+  let scheduledAuthKind = null;
 
-  // ---------- AUTH ----------
+  // Never send the same auth command repeatedly in one connection. The server
+  // prompt, not a blind timer, determines whether to login or register.
+  const authCommandsSent = new Set();
+
+  function clearAuthTimer() {
+    if (promptTimer) clearTimeout(promptTimer);
+    promptTimer = null;
+    scheduledAuthKind = null;
+  }
+
+  function blockAuthentication(reason) {
+    if (authBlocked) return;
+    authBlocked = true;
+    clearAuthTimer();
+
+    console.error('⛔ Automatic authentication stopped: ' + reason);
+    console.error(
+      'Fix the account/password or ask the server administrator to resolve the registration limit, then restart the bot.'
+    );
+  }
+
   function sendAuth(kind) {
-    if (ended || authed) return;
-    const now = Date.now();
-    if (now - lastSentAt < 1500) return;   // avoid "too fast chat" kicks
-    lastSentAt = now;
-    attempts++;
+    if (ended || authed || authBlocked || authCommandsSent.has(kind)) return;
 
-    if (kind === 'register') {
-      const cmd = registerArgs === 1
-        ? `/register ${PASSWORD}`
-        : `/register ${PASSWORD} ${PASSWORD}`;
-      bot.chat(cmd);
-      console.log(`🔑 Sent /register (attempt ${attempts})`);
-    } else {
-      bot.chat(`/login ${PASSWORD}`);
-      console.log(`🔑 Sent /login (attempt ${attempts})`);
+    authCommandsSent.add(kind);
+
+    const command = kind === 'register'
+      ? (registerArgs === 1
+          ? '/register ' + PASSWORD
+          : '/register ' + PASSWORD + ' ' + PASSWORD)
+      : '/login ' + PASSWORD;
+
+    try {
+      bot.chat(command);
+      console.log('🔑 Sent /' + kind + ' once for this connection.');
+    } catch (error) {
+      console.error('⚠️ Could not send authentication command:', error.message || error);
     }
   }
 
   function schedulePromptAuth(kind) {
-    if (promptTimer) clearTimeout(promptTimer);
-    promptTimer = setTimeout(() => sendAuth(kind), 1500);
-  }
+    if (ended || authed || authBlocked || authCommandsSent.has(kind)) return;
+    if (promptTimer && scheduledAuthKind === kind) return;
 
-  // Runs even if the server never says anything we recognise.
-  function fallbackTick() {
-    if (ended || authed) return;
-    if (attempts >= AUTH_MAX_ATTEMPTS) {
-      console.log('⚠️ Could not confirm login; moving on anyway (check the chat log above).');
-      startMovement();
-      return;
-    }
-    // Alternate: login first (account usually exists), then register
-    sendAuth(attempts % 2 === 0 ? 'login' : 'register');
-    fallbackTimer = setTimeout(fallbackTick, AUTH_RETRY_MS);
+    clearAuthTimer();
+    scheduledAuthKind = kind;
+    promptTimer = setTimeout(() => {
+      promptTimer = null;
+      scheduledAuthKind = null;
+      sendAuth(kind);
+    }, 1500);
   }
 
   function onAuthed() {
-    if (authed) return;
+    if (authed || ended || authBlocked) return;
+
     authed = true;
-    clearTimeout(promptTimer);
-    clearTimeout(fallbackTimer);
-    console.log(`✅ ${config.botUsername} is authenticated and Ready!`);
-    startMovement();
+    clearAuthTimer();
+    console.log('✅ ' + config.botUsername + ' is authenticated and ready!');
+
+    // Reset the reconnect delay after a successful authenticated connection.
+    if (reconnectTimer) {
+      clearTimeout(reconnectTimer);
+      reconnectTimer = null;
+    }
+
+    if (bot.entity) startMovement();
   }
 
-  // ---------- EVENTS ----------
-  // 'login' fires as soon as the server accepts us (before chunks load), so the
-  // auth countdown starts immediately instead of waiting for 'spawn'.
   bot.once('login', () => {
-    if (authStarted) return;
-    authStarted = true;
-    fallbackTimer = setTimeout(fallbackTick, AUTH_FIRST_FALLBACK_MS);
+    console.log('✅ Connected to the server; waiting for its login/register prompt.');
   });
 
   bot.on('spawn', () => {
-    // Sneak after 3s (also re-applied after respawn)
-    setTimeout(() => {
-      if (!ended) bot.setControlState('sneak', true);
+    if (sneakTimer) clearTimeout(sneakTimer);
+    sneakTimer = setTimeout(() => {
+      if (!ended && bot.entity) {
+        try {
+          bot.setControlState('sneak', true);
+        } catch (error) {
+          console.warn('⚠️ Could not enable sneak:', error.message || error);
+        }
+      }
     }, 3000);
+
+    if (authed) startMovement();
   });
 
   bot.on('message', (jsonMsg) => {
-    const raw = jsonMsg.toString().trim();
+    const raw = String(jsonMsg).trim();
     if (!raw) return;
-    console.log(`💬 ${raw}`);           // so you can SEE what the server asks for
-    if (authed) return;
+    console.log('💬 ' + raw);
+
+    if (authed || authBlocked || ended) return;
 
     const text = raw.toLowerCase();
+
+    // Stop rather than hammer the server when the account/IP registration
+    // quota has been reached. Client code cannot legitimately bypass this.
+    if (
+      /maximum number of registrations|exceeded.*registrations|registration limit|too many registrations/.test(text) ||
+      /vượt quá.*lượt đăng ký|giới hạn đăng ký/.test(text)
+    ) {
+      blockAuthentication('the server registration limit has been reached.');
+      return;
+    }
+
+    if (
+      /incorrect password|wrong password|invalid password|password is incorrect/.test(text) ||
+      /sai mật khẩu|mật khẩu không đúng/.test(text)
+    ) {
+      blockAuthentication('the server rejected the password.');
+      return;
+    }
 
     if (isAuthSuccess(text)) {
       onAuthed();
       return;
     }
 
-    // Account already exists -> log in instead
+    // An existing account should be logged into, not registered again.
     if (/already registered|đã đăng ký|da dang ky/.test(text)) {
       schedulePromptAuth('login');
       return;
     }
 
-    const wantsRegister = text.includes('/register') || text.includes('dang ky') || text.includes('đăng ký');
-    const wantsLogin = text.includes('/login') || text.includes('dang nhap') || text.includes('đăng nhập');
+    const wantsRegister =
+      text.includes('/register') ||
+      text.includes('please, register') ||
+      text.includes('please register') ||
+      text.includes('đăng ký') ||
+      text.includes('dang ky');
+
+    const wantsLogin =
+      text.includes('/login') ||
+      text.includes('please, login') ||
+      text.includes('please login') ||
+      text.includes('please log in') ||
+      text.includes('đăng nhập') ||
+      text.includes('dang nhap');
 
     if (wantsRegister && !wantsLogin) {
-      // Learn how many arguments the server wants: "/register <password>" vs "/register <password> <confirm>"
-      const m = text.match(/\/register((?:\s+<[^>]*>)+)/);
-      if (m) registerArgs = (m[1].match(/<[^>]*>/g) || []).length >= 2 ? 2 : 1;
-      if (attempts < AUTH_MAX_ATTEMPTS + 4) schedulePromptAuth('register');
-    } else if (wantsLogin && attempts < AUTH_MAX_ATTEMPTS + 4) {
+      // Support both /register <password> and /register <password> <confirm>.
+      const match = text.match(/\/register((?:\s+<[^>]*>)+)/i);
+      if (match) {
+        const placeholders = match[1].match(/<[^>]*>/g) || [];
+        registerArgs = placeholders.length >= 2 ? 2 : 1;
+      }
+      schedulePromptAuth('register');
+    } else if (wantsLogin) {
       schedulePromptAuth('login');
     }
   });
 
   bot.on('kicked', (reason) => {
-    console.log('⛔️ Kicked from server:', typeof reason === 'string' ? reason : JSON.stringify(reason));
+    console.log(
+      '⛔ Kicked from server:',
+      typeof reason === 'string' ? reason : JSON.stringify(reason)
+    );
   });
 
-  bot.on('error', (err) => {
-    if (err.code === 'ECONNRESET') {
-      console.log('⚠️ Network error (ECONNRESET), ignoring - will reconnect if the connection drops.');
+  bot.on('error', (error) => {
+    if (error && (error.code === 'EPIPE' || error.code === 'ECONNRESET')) {
+      // Do not send more chat packets while the socket is closing. The end
+      // event below owns reconnect scheduling.
+      clearAuthTimer();
+      console.warn('⚠️ Connection socket closed (' + error.code + ').');
       return;
     }
-    console.error('⚠️ Error:', err);
+
+    console.error('⚠️ Bot error:', error);
   });
 
   bot.on('end', () => {
     if (ended) return;
     ended = true;
-    clearTimeout(promptTimer);
-    clearTimeout(fallbackTimer);
+
+    clearAuthTimer();
     clearTimeout(moveTimer);
-    console.log(`⛔️ Bot Disconnected! Reconnecting in ${RECONNECT_DELAY_MS / 1000}s...`);
-    setTimeout(startBot, RECONNECT_DELAY_MS);
+    clearTimeout(sneakTimer);
+    clearTimeout(jumpTimer);
+
+    try {
+      bot.clearControlStates();
+    } catch (_) {
+      // The socket may already be closed.
+    }
+
+    if (authBlocked) {
+      console.error(
+        '⛔ Not reconnecting because authentication is blocked. Resolve the server account/password issue and restart the app.'
+      );
+      return;
+    }
+
+    if (reconnectTimer) return;
+
+    console.log(
+      '⛔ Bot disconnected. Reconnecting in ' +
+      Math.round(RECONNECT_DELAY_MS / 1000) + ' seconds...'
+    );
+
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      startBot();
+    }, RECONNECT_DELAY_MS);
   });
 
   // ---------- ANTI-AFK MOVEMENT ----------
   function startMovement() {
-    if (movementStarted || ended) return;
+    if (movementStarted || ended || !authed || !bot.entity) return;
     movementStarted = true;
     moveTimer = setTimeout(movementCycle, STEP_INTERVAL);
   }
 
   function movementCycle() {
-    if (ended || !bot.entity) return;
+    if (ended || !authed || !bot.entity) {
+      movementStarted = false;
+      return;
+    }
 
     switch (movementPhase) {
       case 0:
@@ -183,8 +295,11 @@ function startBot() {
         bot.setControlState('forward', false);
         bot.setControlState('back', false);
         bot.setControlState('jump', true);
-        setTimeout(() => {
-          if (!ended) bot.setControlState('jump', false);
+        if (jumpTimer) clearTimeout(jumpTimer);
+        jumpTimer = setTimeout(() => {
+          if (!ended && bot.entity) {
+            bot.setControlState('jump', false);
+          }
         }, JUMP_DURATION);
         break;
       case 3:
@@ -199,12 +314,22 @@ function startBot() {
   }
 }
 
-startBot();
+if (!PASSWORD) {
+  console.error(
+    '⛔ BOT_PASSWORD is not set. Add it in the hosting panel under Environment Variables, then restart.'
+  );
+  process.exitCode = 1;
+} else {
+  startBot();
+}
 
-// Keep the process alive on unhandled socket errors
+// Socket errors are normally delivered through bot.on('error'). Keep a clear
+// diagnostic for any remaining asynchronous failures.
 process.on('unhandledRejection', (error) => {
-  if (!error || error.code !== 'ECONNRESET') console.error('Unhandled error:', error);
+  console.error('Unhandled rejection:', error);
 });
 process.on('uncaughtException', (error) => {
-  if (!error || error.code !== 'ECONNRESET') console.error('Fatal error:', error);
+  console.error('Uncaught exception:', error);
+  if (error && (error.code === 'EPIPE' || error.code === 'ECONNRESET')) return;
+  process.exitCode = 1;
 });
